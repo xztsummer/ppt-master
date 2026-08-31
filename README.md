@@ -68,7 +68,8 @@ pip install -r requirements.txt
 
 ### 3. 配置 API Key（可选）
 
-> ⚠️ **安全说明**：本仓库提交的 `.env` 已做脱敏处理——**所有 key 行均已注释且不含任何真实值**。本地使用时取消注释并填入你自己的 key；**填入真实 key 后请勿提交推送**。完整配置示例见 [`.env.example`](./.env.example)。
+> ⚠️ **安全说明**：仓库不含任何 `.env`（已列入 `.gitignore`）。本地配置请先复制模板：
+> `cp .env.example .env`，再取消注释并填入你自己的 key——真实 key 不会被提交进仓库。完整配置示例见 [`.env.example`](./.env.example)。
 
 配置通过 `.env` 完成，读取顺序：当前进程环境变量 → `./.env`（当前目录）→ skill 目录 `.env` → `~/.ppt-master/.env`（首个存在的文件生效，不合并）。
 

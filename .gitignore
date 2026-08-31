@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# Local secrets — never commit real keys
+.env
+
 # Project workspaces created at runtime
 projects/
 
