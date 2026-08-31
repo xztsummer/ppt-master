@@ -1,0 +1,10 @@
+# Python runtime artifacts
+__pycache__/
+*.pyc
+
+# Project workspaces created at runtime
+projects/
+
+# OS noise
+.DS_Store
+Thumbs.db
