@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Skill Version](https://img.shields.io/badge/skill%20version-6.3.0-green.svg)](./SKILL.md)
+[![Skill Version](https://img.shields.io/badge/skill%20version-6.3.2-green.svg)](./SKILL.md)
 
 > **English TL;DR** — PPT Master is an agentic-skill workflow that turns source material into
 > **natively editable** PowerPoint files (real DrawingML shapes, charts, tables, formulas and
@@ -31,7 +31,7 @@
 - **质量门禁** — 文本宽度预校准、SVG 质量检查器、视觉审查、导出 postflight 报告，多道闸口守住排版与结构质量。
 - **图片管线** — 15+ AI 生图后端（OpenAI / Gemini / 通义 / 智谱 / 火山引擎 / SiliconFlow / fal / Replicate …），网络图片搜索零配置可用（Openverse / Wikimedia），配置 Pexels / Pixabay 后质量更稳；图片许可自动处理，需署名图片自动加注。
 - **旁白音频** — 默认 `edge-tts` 无需任何 Key；可选 ElevenLabs / MiniMax / 通义 / CosyVoice 云端旁白，四家均支持复刻音色 `voice_id`。
-- **模板资产库** — 22 个品牌预设、15 种视觉风格、9 套版式、5 个成品 deck 模板、33 个图表模板、12000+ 图标（含第三方许可声明）、191 个音效文件。
+- **模板资产库** — 23 个品牌预设、16 种视觉风格、9 套版式、5 个成品 deck 模板、33 个图表模板、12000+ 图标（含第三方许可声明）、191 个音效文件。
 - **本地运行** — 除与 AI 模型的对话外，全流程在你的电脑上完成，数据不出本地。
 
 ## 仓库结构
@@ -43,7 +43,7 @@
 ├── workflows/          # 5 条路线的流程权威 + 阶段 / profile（23 篇）
 ├── references/         # 角色核心与技术参考（117 篇）
 ├── scripts/            # 工具链：source→md、项目初始化、SVG 检查/导出、
-│                       #   生图、图搜、TTS、模板物化等（254 个 Python 脚本）
+│                       #   生图、图搜、TTS、模板物化等（258 个 Python 脚本）
 ├── templates/          # 品牌 / 风格 / 版式 / deck / 图表 / 图标 / 音效资产库
 ├── .env.example        # API Key 配置模板（全部为占位注释）
 └── requirements.txt    # 可选依赖清单
@@ -96,7 +96,7 @@ AI 全程处理：内容分析、视觉设计、SVG 生成、质量检查、PPTX
 
 ## 与上游仓库的关系
 
-本仓库是从 [hugohe3/ppt-master](https://github.com/hugohe3/ppt-master) **v6.3.0（MIT License）** 提取的纯 skill 技能包，并在本地定制基础上再发布（含新增的 `中国电子云` deck 模板等）。
+本仓库是从 [hugohe3/ppt-master](https://github.com/hugohe3/ppt-master) **v6.3.2（MIT License）** 提取的纯 skill 技能包，并在本地定制基础上再发布（含新增的 `中国电子云` deck 模板等）。
 
 感谢原作者 [Hugo He](https://github.com/hugohe3) 的开源贡献。上游完整仓库还包含用户文档（快速入门 / FAQ / Windows 安装指南 / 技术设计）、示例工程与持续更新，推荐访问：
 

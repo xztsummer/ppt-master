@@ -68,8 +68,19 @@ _SHEET_DIAGNOSTIC_BUCKET_SIZE = 4
 # larger tolerance absorbs; farther pixels are content crossing the gutter.
 _KEY_DRIFT_MAX_TOLERANCE = 48
 _KEY_DRIFT_MARGIN = 4
+# A key-dominant pixel whose strongest non-key channel reaches this fraction of
+# the key channel is opaque foreground of a key-like hue (malachite green on a
+# green key), not a semi-transparent blend with the key; color-to-alpha recovery
+# and despill skip it so the element keeps its own color.
+_KEY_PURITY_OPAQUE_RATIO = 0.6
 # At most this many trim pixels on a touched edge count as isolated drift.
 _EDGE_DRIFT_MAX_PIXELS = 8
+# Strict-alpha haze gate: when this share of an element's trimmed box sits in
+# the semi-transparent alpha band, the key field itself was recovered as soft
+# alpha (the sheet ground is not the stated key), not an element edge.
+_HAZE_ALPHA_LOW = 20
+_HAZE_ALPHA_HIGH = 150
+_HAZE_MAX_SHARE = 0.15
 # Corner sample inset (px) and minimum cell fill for the backing-panel notice.
 _PANEL_CORNER_INSET = 2
 _PANEL_MIN_FILL = 0.75
@@ -89,6 +100,20 @@ def parse_grid(spec: str) -> tuple[int, int]:
     if rows < 1 or cols < 1:
         raise ValueError(f"--grid rows and cols must be >= 1, got {rows}x{cols}")
     return rows, cols
+
+
+def parse_inset(spec: str) -> tuple[float, float]:
+    """Parse `--inset` as one fraction or `H,V`; both must lie in [0, 0.5)."""
+    parts = [part.strip() for part in str(spec).split(",")]
+    if len(parts) not in (1, 2) or not all(parts):
+        raise ValueError("--inset must be one fraction or H,V")
+    try:
+        values = [float(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError("--inset must be one fraction or H,V") from exc
+    if not all(0.0 <= value < 0.5 for value in values):
+        raise ValueError("--inset must be in [0, 0.5)")
+    return (values[0], values[-1])
 
 
 def parse_hex(value: str) -> tuple[int, int, int]:
@@ -314,13 +339,43 @@ def _chroma_alpha(rgb: Image.Image, bg: tuple[int, int, int]) -> Image.Image:
     other_channels = [
         channel for index, channel in enumerate(channels) if index != key_index
     ]
-    key_excess = ImageChops.subtract(
+    key_blend = _key_blend_mask(
         channels[key_index],
         ImageChops.lighter(other_channels[0], other_channels[1]),
     )
-    key_dominance = key_excess.point(lambda value: 255 if value > 0 else 0)
     opaque = Image.new("L", rgb.size, 255)
-    return Image.composite(raw_alpha, opaque, key_dominance)
+    return Image.composite(raw_alpha, opaque, key_blend)
+
+
+def _key_blend_mask(key_channel: Image.Image, other_max: Image.Image) -> Image.Image:
+    """Mask the pixels that read as a blend of foreground with a pure key.
+
+    A pixel qualifies only when the key channel dominates and the strongest
+    non-key channel stays below `_KEY_PURITY_OPAQUE_RATIO` of it. An opaque
+    foreground color that merely shares the key's hue (a malachite green under a
+    green key) keeps a substantial non-key channel and is left opaque, while
+    antialiased edges, soft shadows, and glows composited over the key fall
+    below the ratio and still receive color-to-alpha recovery.
+    """
+    ratio_num = round(_KEY_PURITY_OPAQUE_RATIO * 10)
+    if hasattr(ImageMath, "lambda_eval"):
+        blend = ImageMath.lambda_eval(
+            lambda op: op["convert"](
+                (op["key"] > op["other"])
+                & (op["other"] * 10 < op["key"] * ratio_num),
+                "L",
+            ),
+            key=key_channel,
+            other=other_max,
+        )
+    else:
+        blend = ImageMath.eval(  # type: ignore[attr-defined]
+            "convert((key > other) & (other * 10 < key * ratio), 'L')",
+            key=key_channel,
+            other=other_max,
+            ratio=ratio_num,
+        )
+    return blend.point(lambda value: 255 if value else 0)
 
 
 def _decontaminate_channel(
@@ -469,14 +524,24 @@ def _keying_findings(
         if touched_edges:
             drift = _edge_drift(trim_mask, diff, touched_edges)
             if drift is not None:
-                count, distance = drift
-                findings.append(
-                    f"{label}: {count} isolated pixel(s) on the "
-                    f"{'/'.join(touched_edges)} cell edge(s) exceed the key "
-                    f"tolerance (farthest {distance} from key {hex_bg}); this is "
-                    f"key drift, not content — rerun with --tolerance "
-                    f"{distance + _KEY_DRIFT_MARGIN} or higher"
-                )
+                count, distance, isolated = drift
+                if isolated:
+                    findings.append(
+                        f"{label}: {count} isolated pixel(s) on the "
+                        f"{'/'.join(touched_edges)} cell edge(s) exceed the key "
+                        f"tolerance (farthest {distance} from key {hex_bg}); this is "
+                        f"key drift, not content — rerun with --tolerance "
+                        f"{distance + _KEY_DRIFT_MARGIN} or higher"
+                    )
+                else:
+                    findings.append(
+                        f"{label}: {count} pixel(s) on the "
+                        f"{'/'.join(touched_edges)} cell edge(s) exceed the key "
+                        f"tolerance but all stay within {distance} of key {hex_bg}; "
+                        f"this is key noise (JPEG compression or a slightly off "
+                        f"key), not content — rerun with --tolerance "
+                        f"{distance + _KEY_DRIFT_MARGIN} or higher"
+                    )
             else:
                 findings.append(
                     f"{label}: content reaches the {'/'.join(touched_edges)} "
@@ -484,6 +549,39 @@ def _keying_findings(
                 )
 
     return findings
+
+
+def _haze_finding(
+    label: str,
+    alpha_mask: Image.Image,
+    bbox: tuple[int, int, int, int],
+    bg: tuple[int, int, int],
+) -> Optional[str]:
+    """Report an element box that is mostly semi-transparent haze.
+
+    Soft-alpha recovery assumes the key field lies at the stated key; when the
+    real ground sits farther than the tolerance, the whole field comes back as
+    faint half-foreground that reads as a glowing rectangle on a dark slide.
+    `--strict-alpha` only inspects the outer gutter, so this gate looks at the
+    trimmed box itself.
+    """
+    box = alpha_mask.crop(bbox)
+    total = box.width * box.height
+    if total == 0:
+        return None
+    histogram = box.histogram()
+    hazy = sum(histogram[_HAZE_ALPHA_LOW:_HAZE_ALPHA_HIGH + 1])
+    share = hazy / total
+    if share <= _HAZE_MAX_SHARE:
+        return None
+    hex_bg = "#{:02X}{:02X}{:02X}".format(*bg)
+    return (
+        f"{label}: {share:.0%} of the trimmed element box is semi-transparent "
+        f"(alpha {_HAZE_ALPHA_LOW}-{_HAZE_ALPHA_HIGH}): the key field itself "
+        f"was recovered as soft alpha, so the sheet ground is not {hex_bg}; "
+        "rerun with --bg set to the measured ground colour (see the sheet "
+        "border line below) instead of the nearest pure key"
+    )
 
 
 def _backing_panel_notice(
@@ -528,9 +626,12 @@ def _edge_drift(
     trim_mask: Optional[Image.Image],
     diff: Optional[Image.Image],
     touched_edges: list[str],
-) -> Optional[tuple[int, int]]:
-    """Return (pixel count, max key distance) when the touched edges hold only
-    a few near-key pixels, or None when real content reaches an edge."""
+) -> Optional[tuple[int, int, bool]]:
+    """Return (pixel count, max key distance, isolated) when every pixel on
+    the touched edges stays near the key, or None when real content reaches
+    an edge. ``isolated`` is True for a handful of stray pixels; False means
+    the whole edge is near-key noise (JPEG ringing, a slightly off key), which
+    is still keying drift rather than content."""
     if trim_mask is None or diff is None:
         return None
     width, height = trim_mask.size
@@ -546,12 +647,12 @@ def _edge_drift(
     if "bottom" in touched_edges:
         coords.update((x, height - 1) for x in range(width))
     hits = [diff_px[x, y] for x, y in coords if mask_px[x, y]]
-    if not hits or len(hits) > _EDGE_DRIFT_MAX_PIXELS:
+    if not hits:
         return None
     distance = max(hits)
     if distance > _KEY_DRIFT_MAX_TOLERANCE:
         return None
-    return len(hits), distance
+    return len(hits), distance, len(hits) <= _EDGE_DRIFT_MAX_PIXELS
 
 
 def _log_keying_findings(
@@ -625,7 +726,7 @@ def slice_sheet(
     *,
     names: Optional[list[str]] = None,
     prefix: Optional[str] = None,
-    inset: float = 0.0,
+    inset: float | tuple[float, float] = 0.0,
     trim: bool = False,
     alpha: bool = False,
     strict_alpha: bool = False,
@@ -639,6 +740,7 @@ def slice_sheet(
     automated run never silently drops cells. Each name must be a bare filename.
     """
     total_cells = rows * cols
+    inset_x, inset_y = inset if isinstance(inset, tuple) else (inset, inset)
     if strict_alpha and not alpha:
         raise ValueError("strict_alpha requires alpha=True")
     if names is not None and len(names) != total_cells:
@@ -682,9 +784,9 @@ def slice_sheet(
             # Integer cell box via per-index rounding to avoid drift.
             x0, x1 = round(c * sw / cols), round((c + 1) * sw / cols)
             y0, y1 = round(r * sh / rows), round((r + 1) * sh / rows)
-            if inset > 0:
-                dx = round((x1 - x0) * inset)
-                dy = round((y1 - y0) * inset)
+            if inset_x > 0 or inset_y > 0:
+                dx = round((x1 - x0) * inset_x)
+                dy = round((y1 - y0) * inset_y)
                 x0, x1, y0, y1 = x0 + dx, x1 - dx, y0 + dy, y1 - dy
             cell = sheet.crop((x0, y0, x1, y1))
 
@@ -705,6 +807,10 @@ def slice_sheet(
                     trim=trim, alpha=alpha, trim_mask=trim_mask, diff=diff,
                     notices=notices,
                 ))
+                if strict_alpha:
+                    haze = _haze_finding(f"cell ({r},{c})", alpha_mask, bbox, cell_bg)
+                    if haze:
+                        findings.append(haze)
 
             if trim and trim_mask is not None and alpha_mask is not None and bbox is not None:
                 cell = cell.crop(bbox)
@@ -782,8 +888,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filename prefix when --names is absent (default: '<sheet-stem>_')",
     )
     parser.add_argument(
-        "--inset", type=float, default=0.0,
-        help="Trim each cell inward by this fraction on every side (0-0.49) to drop gutters",
+        "--inset", type=str, default="0",
+        help=(
+            "Trim each cell inward by this fraction (0-0.49) to drop gutters: "
+            "one value for every side, or H,V (e.g. 0.01,0.03) when wide cells "
+            "only need the horizontal grid line trimmed"
+        ),
     )
     parser.add_argument(
         "--trim", action="store_true",
@@ -800,7 +910,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bg", default=None,
         help="Background hex color for --trim/--alpha; an exact pure red/green/blue "
-             "key enables despill and soft-alpha recovery (default: auto-sample)",
+             "key enables despill and soft-alpha recovery, skipping opaque "
+             "foreground pixels of a key-like hue (default: auto-sample)",
     )
     parser.add_argument(
         "--tolerance", type=int, default=18,
@@ -827,8 +938,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
-    if not 0.0 <= args.inset < 0.5:
-        print("[ERROR] --inset must be in [0, 0.5)", file=sys.stderr)
+    try:
+        inset = parse_inset(args.inset)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
     if not 0 <= args.tolerance <= 255:
         print("[ERROR] --tolerance must be in [0, 255]", file=sys.stderr)
@@ -843,7 +956,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         written = slice_sheet(
             sheet_path, rows, cols, output_dir,
-            names=names, prefix=args.prefix, inset=args.inset,
+            names=names, prefix=args.prefix, inset=inset,
             trim=args.trim, alpha=args.alpha, strict_alpha=args.strict_alpha,
             bg=bg, tolerance=args.tolerance,
         )
