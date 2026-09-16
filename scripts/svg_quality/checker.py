@@ -46,11 +46,13 @@ try:
     from project_utils import (
         CANVAS_FORMATS,
         validate_communication_trace,
+        validate_outline_roster,
     )
 except ImportError:
     print("Warning: Unable to import project_utils")
     CANVAS_FORMATS = {}
     validate_communication_trace = None
+    validate_outline_roster = None
 
 from svg_to_pptx.canvas_contract import (
     CanvasContractError,
@@ -323,6 +325,7 @@ try:
         parse_optional_layout_slides as _parse_optional_layout_slides,
         parse_template_slide as _parse_template_structure_slide,
         parse_template_slides as _parse_template_structure_slides,
+        structured_layout_definition_files as _structured_layout_definition_files,
         _structure_subtree_signature as _structure_subtree_signature,
         template_lock_errors as _template_lock_errors,
         template_prototype_errors as _template_prototype_errors,
@@ -335,6 +338,7 @@ except ImportError:
     _parse_optional_layout_slides = None
     _parse_template_structure_slide = None
     _parse_template_structure_slides = None
+    _structured_layout_definition_files = None
     _structure_subtree_signature = None
     _template_lock_errors = None
     _template_prototype_errors = None
@@ -392,6 +396,24 @@ HEX_VALUE_RE = re.compile(
 # native_structure_mode: structured declaration. Legacy template-mode packages
 # fail closed; Create Template must author a new current-contract workspace.
 _CHECK_PPTX_STRUCTURED_PROJECT = True
+
+_SPEC_RELATIONSHIPS_LINE_RE = re.compile(
+    r'^\s*-\s*\*\*Relationships(?:\s*\([^)]*\))?\*\*\s*[:：]\s*(?P<value>.*)$'
+)
+_CARRIED_RELATION_WORD_RE = re.compile(
+    r'\b(?:order|link|parent|membership)\b', re.IGNORECASE
+)
+
+
+def count_carried_relationship_pages(design_spec_text: str) -> int:
+    """Count §IX ``Relationships`` lines naming order, link, parent, or membership."""
+    count = 0
+    for line in design_spec_text.splitlines():
+        match = _SPEC_RELATIONSHIPS_LINE_RE.match(line)
+        if match and _CARRIED_RELATION_WORD_RE.search(match.group('value')):
+            count += 1
+    return count
+
 
 _BARE_HEX_VALUE_RE = re.compile(
     r"(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{4}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})"
@@ -1187,7 +1209,11 @@ class SVGQualityChecker:
         self._communication_traced_projects: set[Path] = set()
         self._pptx_structure_issues: List[Tuple[str, str]] = []
         self._has_incomplete_page_roster = False
+        self._structured_native_slots: list[str] = []
         self._active_slide_count: int | None = None
+        # Early/page stages see part of the roster, so a slide jump's upper
+        # bound waits for the final gate.
+        self.partial_roster = False
         self._prototype_by_output: Dict[Path, Path] = {}
         self._active_prototype_path: Path | None = None
         self._active_template_reuse_scope: str | None = None
@@ -1287,6 +1313,24 @@ class SVGQualityChecker:
                 else:
                     if hydrated_payloads:
                         result['info']['native_payload_refs'] = hydrated_payloads
+
+                if (
+                    self.quick_generate
+                    and svg_path.name == sorted(
+                        p.name for p in svg_path.parent.glob('*.svg')
+                    )[0]
+                    and not (
+                        root.get('lang')
+                        or root.get('{http://www.w3.org/XML/1998/namespace}lang')
+                    )
+                ):
+                    result['warnings'].append(
+                        'Quick roster declares no deck language: put '
+                        'lang="<BCP-47>" (vi-VN, he-IL, ...) on the first '
+                        "page's root <svg>; export reads it for run proofing "
+                        'language, right-to-left defaults, theme script slots '
+                        'and docProps (advisory)'
+                    )
 
                 # 1. Check viewBox
                 self._check_viewbox(
@@ -1416,6 +1460,8 @@ class SVGQualityChecker:
                     )
 
             # Determine pass/fail
+            if self.template_mode:
+                self._classify_preserved_mirror_geometry(svg_path, result)
             result['passed'] = len(result['errors']) == 0
 
         except Exception as e:
@@ -1423,6 +1469,57 @@ class SVGQualityChecker:
             result['passed'] = False
 
         return self._record_result(result)
+
+    def _classify_preserved_mirror_geometry(self, svg_path: Path, result: Dict) -> None:
+        """Report immutable source geometry as inherited, never exempt edits.
+
+        The materializer records the exact published SVG hash. Only its text
+        width estimates and source-object overlap qualify; XML, assets, native
+        payloads and reusable structure remain fully blocking.
+        """
+        manifest_path = svg_path.parent / 'template_execution_manifest.json'
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return
+        if (not isinstance(manifest, dict)
+                or manifest.get('schema') != 'ppt-master.template-execution-manifest.v1'
+                or manifest.get('replication_mode') != 'mirror'
+                or manifest.get('source_geometry_unchanged') is not True
+                or not re.fullmatch(r'[0-9a-f]{64}', str(manifest.get('source_package_sha256', '')))):
+            return
+        entries = manifest.get('templates')
+        if not isinstance(entries, list):
+            return
+        if not any(isinstance(entry, dict)
+                   and entry.get('prototype') == svg_path.name
+                   and entry.get('source_svg_sha256') == result.get('source_sha256')
+                   for entry in entries):
+            return
+        dependencies = manifest.get('source_files_sha256')
+        if not isinstance(dependencies, dict) or not dependencies:
+            return
+        try:
+            for relative, digest in dependencies.items():
+                path = (svg_path.parent / relative).resolve()
+                path.relative_to(svg_path.parent.parent.resolve())
+                if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                    return
+        except (OSError, ValueError, TypeError):
+            return
+        result['info']['mirror_source_unchanged'] = True
+        source_import = manifest.get('source_import')
+        if isinstance(source_import, dict):
+            self._source_import_summary = source_import
+        for bucket in ('errors', 'warnings'):
+            for message in list(result[bucket]):
+                if (message.startswith('<text>') and ' exceeds ' in message) or (
+                    message.startswith('<g ') and ' data-pptx-bounds overlaps ' in message
+                ):
+                    result[bucket].remove(message)
+                    result['info'].setdefault('inherited', []).append({
+                        'kind': 'mirror-source-geometry', 'message': message,
+                    })
 
     def _record_result(self, result: Dict) -> Dict:
         """Append one file result and update aggregate counters."""
@@ -1456,6 +1553,7 @@ class SVGQualityChecker:
         project_path = Path(workspace).resolve()
         authoring_dir = project_path / 'authoring-svg-flat'
         self._has_incomplete_page_roster = False
+        self._structured_native_slots: list[str] = []
         if not project_path.is_dir():
             print(f"[ERROR] Round-trip workspace does not exist: {project_path}")
             self.summary['errors'] += 1
@@ -2206,10 +2304,17 @@ class SVGQualityChecker:
                 for error in errors
             )
             return
+        def normalizer(error: str) -> str:
+            if "page-space metadata" in error:
+                return (
+                    "`python3 scripts/compact_svg_coordinates.py <svg_output> "
+                    "--inplace --keep-native-frames`"
+                )
+            return "`python3 scripts/compact_svg_styles.py <svg_output> --inplace`"
+
         result['warnings'].extend(
             f"Noncanonical compact authoring: {error} "
-            "(advisory; normalize with "
-            "`python3 scripts/compact_svg_styles.py <svg_output> --inplace`, "
+            f"(advisory; normalize with {normalizer(error)}, "
             "re-stamp pages that carry Chart/Table fallbacks, and rerun the "
             "final gate, or leave the explicit form)"
             for error in errors
@@ -2779,7 +2884,7 @@ class SVGQualityChecker:
             f'Invalid SVG hyperlink: {error}'
             for error in _project_hyperlink_errors(
                 root,
-                slide_count=self._active_slide_count,
+                slide_count=None if self.partial_roster else self._active_slide_count,
             )
         )
 
@@ -3260,7 +3365,10 @@ class SVGQualityChecker:
             return None
         line_groups = None
         synthetic_first = None
-        if (text_el.text or '').strip():
+        leads_with_inline_run = (
+            cls._is_tspan(children[0]) and not cls._is_line_tspan(children[0])
+        )
+        if (text_el.text or '').strip() or leads_with_inline_run:
             if _classify_paragraph_block is None:
                 return None
             paragraph = _classify_paragraph_block(
@@ -4413,10 +4521,15 @@ class SVGQualityChecker:
             if self._is_hidden_element(text_element, parent_by_id):
                 continue
             visible_text = ''.join(text_element.itertext())
-            if (
-                not visible_text.strip()
-                or ('{{' in visible_text and '}}' in visible_text)
-            ):
+            marker_text = '{{' in visible_text and '}}' in visible_text
+            slot = parent_by_id.get(id(text_element))
+            template_carrier = (
+                self.template_mode
+                and text_element.get('data-pptx-carrier') == 'true'
+                and slot is not None
+                and slot.get('data-pptx-placeholder') is not None
+            )
+            if not visible_text.strip() or (marker_text and not template_carrier):
                 continue
             estimated = self._estimated_text_bounds(
                 text_element,
@@ -4425,11 +4538,19 @@ class SVGQualityChecker:
                 letter_spacings,
                 include_headroom=True,
             )
+            if estimated is not None and marker_text:
+                # A token has no content-width contract, but its carrier still
+                # has the same baseline/line-box contract as a generated page.
+                resolved_slot = self._resolved_root_module_bounds(slot)
+                if resolved_slot is not None:
+                    boundary = resolved_slot[1]
+                    estimated = (boundary[0], estimated[1], boundary[2], estimated[3])
             if estimated is not None:
                 estimated_by_id[id(text_element)] = estimated
 
             if (
-                canvas is None
+                marker_text
+                or canvas is None
                 or self._has_zero_opacity(text_element, parent_by_id)
             ):
                 continue
@@ -4487,7 +4608,9 @@ class SVGQualityChecker:
             result['warnings'].append(
                 'Cannot verify root viewBox bounds for visible text with '
                 f'unsupported or unresolved geometry: {sample}{suffix}; use '
-                'supported explicit text positioning when page fit matters'
+                'supported explicit text positioning when page fit matters '
+                '(continuation <tspan> lines repeat the parent x; a hanging '
+                'indent needs its own <text>)'
             )
 
         root_groups = [
@@ -4905,7 +5028,9 @@ class SVGQualityChecker:
                         f"{int(display_w)}x{int(display_h)} {fit_label} frame; "
                         f"the source is {source_mib:.1f} MiB — file-size "
                         "advisory only, not an aspect-ratio warning; consider "
-                        "a smaller source asset"
+                        "a smaller source asset, or export with "
+                        "svg_to_pptx.py --image-sizing display to downsize "
+                        "at export time"
                     )
             except ImportError:
                 pass  # PIL not available, skip resolution check
@@ -6179,6 +6304,8 @@ class SVGQualityChecker:
             if local_name in definition_containers:
                 return
             if local_name == 'text':
+                if element.get('data-pptx-layer') in {'master', 'layout'}:
+                    return
                 counts.update(collect_text_object_sizes(element))
                 return
             for child in element:
@@ -6775,6 +6902,7 @@ class SVGQualityChecker:
         """
         dir_path = Path(directory)
         self._has_incomplete_page_roster = False
+        self._structured_native_slots: list[str] = []
         self._undeclared_size_occurrences = Counter()
         self._undeclared_size_counts_ready = False
 
@@ -7040,6 +7168,11 @@ class SVGQualityChecker:
                     ('error', message)
                     for message in validate_communication_trace(project_path)
                 )
+                if not self.partial_roster and validate_outline_roster is not None:
+                    self._communication_trace_issues.extend(
+                        ('error', message)
+                        for message in validate_outline_roster(project_path)
+                    )
         return self.results
 
     def _check_pptx_structure_contract(
@@ -7066,6 +7199,10 @@ class SVGQualityChecker:
                 return
             if specs is None:
                 return
+            self._structured_native_slots = sorted({
+                str(item.placeholder) for spec in specs for item in spec.placeholders
+                if item.placeholder in {'chart', 'table'}
+            })
             self._pptx_structure_issues.extend(
                 ('error', message)
                 for message in self._shared_fixed_layer_errors(specs)
@@ -7218,6 +7355,24 @@ class SVGQualityChecker:
             self._pptx_structure_issues.append(('error', str(exc)))
             return
 
+        dependency_specs = list(specs)
+        try:
+            # Use the exporter's registered dependencies, including explicitly
+            # retained prototypes which have no public page in this deck.
+            definition_files = _structured_layout_definition_files(specs, structure_lock)
+            dependency_specs.extend(
+                _parse_template_structure_slide(path, len(specs) + index)
+                for index, path in enumerate(definition_files, start=1)
+            )
+        except _TemplateStructureError as exc:
+            if complete_roster:
+                self._pptx_structure_issues.append(('error', str(exc)))
+        self._structured_native_slots = sorted({
+            str(item.placeholder)
+            for spec in dependency_specs
+            for item in spec.placeholders
+            if item.placeholder in {'chart', 'table'}
+        })
         if complete_roster:
             actual_slides = {spec.slide_num for spec in specs}
             expected_slides = {
@@ -7857,10 +8012,68 @@ class SVGQualityChecker:
                     )
                     if resolved is not None:
                         references[filename].add(resolved.resolve())
+            # A text picture fill keeps its <image> inside <defs><pattern
+            # data-pptx-text-image-fill>; the glyphs that reference the
+            # pattern render that file, so it counts as a placement.
+            for element in cls._text_image_fill_images(working_root):
+                href = (
+                    element.get('href')
+                    or element.get(f'{{{XLINK_NS}}}href')
+                    or ''
+                )
+                if href.lstrip().lower().startswith('data:'):
+                    inline_count += 1
+                    continue
+                filename = cls._external_image_reference_basename(href)
+                if not filename:
+                    continue
+                references.setdefault(filename, set())
+                placements[filename].append((
+                    svg_path,
+                    element.get('preserveAspectRatio') or '',
+                    ('text picture fill',),
+                    None,
+                ))
+                if _resolve_external_image_reference is not None:
+                    resolved = _resolve_external_image_reference(
+                        svg_path.parent,
+                        href,
+                    )
+                    if resolved is not None:
+                        references[filename].add(resolved.resolve())
             out[svg_path] = dict(references)
             if inline_count:
                 inline_counts[svg_path] = inline_count
         return out, inline_counts, dict(placements)
+
+    @classmethod
+    def _text_image_fill_images(cls, root: ET.Element) -> List[ET.Element]:
+        """Return <image> children of text picture-fill patterns in use."""
+        patterns = {
+            pattern.get('id'): pattern
+            for pattern in root.iter(f'{{{SVG_NS}}}pattern')
+            if pattern.get('data-pptx-text-image-fill') and pattern.get('id')
+        }
+        if not patterns:
+            return []
+        used: set[str] = set()
+        for element in root.iter():
+            if _local_name(element) not in {'text', 'tspan'}:
+                continue
+            style_values = (
+                _parse_inline_style(element.get('style'))
+                if _parse_inline_style is not None
+                else {}
+            )
+            fill = style_values.get('fill') or element.get('fill') or ''
+            match = re.match(r'\s*url\(\s*[\'"]?#([^)\'"\s]+)', fill)
+            if match and match.group(1) in patterns:
+                used.add(match.group(1))
+        return [
+            image
+            for pattern_id in used
+            for image in patterns[pattern_id].iter(f'{{{SVG_NS}}}image')
+        ]
 
     @staticmethod
     def _image_frame_geometry(
@@ -9064,7 +9277,7 @@ class SVGQualityChecker:
                 "remain non-blocking"
             )
             print(f"  4. foreignObject: Use <text> + <tspan> for manual line breaks")
-            print(f"  5. Font issues: use PPT-safe exported typefaces (e.g. Microsoft YaHei / Arial / Consolas)")
+            print(f"  5. Font issues: use PPT-safe exported typefaces (e.g. Arial / Consolas, with the CJK face of the deck language)")
 
     def _carrier_receipt_summary(self) -> Dict:
         """Aggregate factual per-page carrier receipts for compact review."""
@@ -9153,11 +9366,37 @@ class SVGQualityChecker:
             'pages': len(receipts),
             'totals': dict(totals),
             'pages_with': dict(pages_with),
+            'relationship_pages': self._relationship_page_count(),
             'geometry_elements': dict(sorted(geometry_counts.items())),
             'preset_names': dict(sorted(preset_names.items())),
             'native_objects': dict(sorted(native_objects.items())),
             'image_page_max_frame_share_range': frame_share_range,
         }
+
+    def _relationship_page_count(self) -> int | None:
+        """Count design_spec §IX pages whose Relationships line names a carried relation.
+
+        The executor's receipt review compares pages carrying a preset or
+        connector against pages whose ``Relationships`` line names ``order``,
+        ``link``, ``parent``, or ``membership``; this reads that count from the
+        project's ``design_spec.md`` so the comparison is on the receipt. None
+        when no exact ``design_spec.md`` is present (Quick, templates).
+        """
+        paths = [
+            Path(result['path'])
+            for result in self.results
+            if result.get('path') and result.get('info', {}).get('carrier_receipt')
+        ]
+        if not paths:
+            return None
+        spec_path = self._resolve_project_path(paths[0]) / 'design_spec.md'
+        if not spec_path.is_file():
+            return None
+        try:
+            text = spec_path.read_text(encoding='utf-8')
+        except OSError:
+            return None
+        return count_carried_relationship_pages(text)
 
     def _print_carrier_receipt_summary(self) -> None:
         """Print a compact actual-use receipt without a score or threshold."""
@@ -9202,6 +9441,16 @@ class SVGQualityChecker:
             else '(none)'
         )
         print(f"  Presets: {preset_text}")
+        relationship_pages = receipt.get('relationship_pages')
+        preset_pages = pages_with['presets']
+        if relationship_pages is None:
+            print(f"  Pages carrying a preset or connector: {preset_pages}")
+        else:
+            print(
+                f"  Relationship pages: {relationship_pages} "
+                "(§IX names order / link / parent / membership) | "
+                f"pages carrying a preset or connector: {preset_pages}"
+            )
         image_range = receipt['image_page_max_frame_share_range']
         if image_range:
             print(
@@ -9212,6 +9461,10 @@ class SVGQualityChecker:
     def _print_provenance_category_summary(self):
         """Print compact JSON-equivalent counts for token-safe gate handling."""
         categories = self._provenance_categories()
+        unchanged_mirror = self.template_mode and self.results and all(
+            result.get('info', {}).get('mirror_source_unchanged')
+            for result in self.results
+        )
         rows = (
             (
                 'blocking',
@@ -9221,7 +9474,8 @@ class SVGQualityChecker:
             (
                 'introduced',
                 len(categories['introduced']),
-                'advisory; new or changed',
+                ('advisory; mirror: source-authored spellings, workspace unmodified'
+                 if unchanged_mirror else 'advisory; new or changed'),
             ),
             (
                 'inherited',
@@ -9283,7 +9537,7 @@ class SVGQualityChecker:
         """Print project-level communication trace issues."""
         if not self._communication_trace_issues:
             return
-        print("\n[COMMUNICATION TRACE] Contract and Audience move checks")
+        print("\n[COMMUNICATION TRACE] Contract, Audience move, and outline roster checks")
         for severity, message in self._communication_trace_issues:
             print(f"  [{severity.upper()}] {message}")
 

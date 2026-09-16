@@ -120,6 +120,8 @@ class SliceImagesDiagnosticsTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
 
@@ -163,6 +165,8 @@ class SliceImagesDiagnosticsTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
 
@@ -203,7 +207,7 @@ class SliceImagesDiagnosticsTests(unittest.TestCase):
                     "--bg", "#0000FF", "--inset", "0,0.06",
                     "--output", str(output_dir),
                 ],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(Image.open(output_dir / "a.png").size, (381, 33))
@@ -230,7 +234,7 @@ class SliceImagesDiagnosticsTests(unittest.TestCase):
             ]
             result = subprocess.run(
                 args + ["--bg", "#0000FF", "--tolerance", "62"],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             )
             self.assertEqual(result.returncode, 1)
             self.assertIn("semi-transparent", result.stderr)
@@ -239,10 +243,40 @@ class SliceImagesDiagnosticsTests(unittest.TestCase):
 
             result = subprocess.run(
                 args + ["--bg", "#034AF4", "--tolerance", "62"],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(Image.open(output_dir / "mark.png").size, (41, 41))
+
+    def test_strict_alpha_names_painted_card_cells_instead_of_a_key_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sheet_path = root / "sheet.png"
+            output_dir = root / "output"
+            # The model painted each cell as a dark card and left the key only
+            # as thin grid lines: after --inset the cells are all panel.
+            image = Image.new("RGB", (200, 100), (0, 0, 255))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((3, 3, 96, 96), fill=(12, 14, 30))
+            draw.rectangle((103, 3, 196, 96), fill=(12, 14, 30))
+            draw.rectangle((30, 30, 60, 60), fill=(240, 200, 120))
+            draw.rectangle((130, 30, 160, 60), fill=(240, 200, 120))
+            image.save(sheet_path)
+
+            result = subprocess.run(
+                [
+                    sys.executable, str(SCRIPT), str(sheet_path),
+                    "--grid", "1x2", "--names", "a,b",
+                    "--trim", "--alpha", "--strict-alpha",
+                    "--bg", "#0000FF", "--inset", "0.05",
+                    "--output", str(output_dir),
+                ],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("painted backing panel", result.stderr)
+            self.assertIn("Cells painted as panels", result.stderr)
+            self.assertNotIn("Suggested rerun:", result.stderr)
 
 
 class ImageOrientationProcessingTests(unittest.TestCase):

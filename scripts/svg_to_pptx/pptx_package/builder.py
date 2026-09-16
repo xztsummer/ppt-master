@@ -71,7 +71,7 @@ from pptx_opc_validation import (
 from pptx_workspace import WorkspaceResourceSpec
 from pptx_ooxml.clone import clone_presentation_slides
 from pptx_ooxml.package import prune_unreferenced_directory_parts
-from language_tags import normalize_language_tag
+from language_tags import language_uses_rtl, office_language_tag
 from hyperlink_contract import (
     HYPERLINK_REL_TYPE,
     trigger_shape_hyperlink_errors,
@@ -97,7 +97,7 @@ from ..drawingml.theme_fonts import (
     apply_master_text_style_spec,
     apply_theme_font_spec,
 )
-from ..drawingml.utils import EMU_PER_PX
+from ..drawingml.utils import EMU_PER_PX, detect_text_lang
 from ..semantic_markers import (
     chrome_token_from_markers,
     page_layout_name_from_svg,
@@ -166,6 +166,26 @@ THEME_REL_TYPE = (
 )
 THEME_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.theme+xml"
 PML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+# ST_SlideSizeType tokens for the standard screen ratios; every other canvas
+# (portrait story, banner, print) is ``custom``. python-pptx's default
+# template says ``screen4x3`` whatever cx/cy are set to afterwards.
+_SLIDE_SIZE_TYPES = ((4, 3, "screen4x3"), (16, 9, "screen16x9"), (16, 10, "screen16x10"))
+
+
+def _slide_size_type(width_emu: int, height_emu: int) -> str:
+    """Return the ``p:sldSz type`` token matching a slide size."""
+    for ratio_w, ratio_h, token in _SLIDE_SIZE_TYPES:
+        if abs(width_emu * ratio_h - height_emu * ratio_w) <= max(width_emu, height_emu) // 200:
+            return token
+    return "custom"
+
+
+def _set_slide_size_type(presentation, width_emu: int, height_emu: int) -> None:
+    """Make the ``type`` token agree with the cx/cy the exporter just set."""
+    slide_size = presentation.element.find(f"{{{PML_NS}}}sldSz")
+    if slide_size is not None:
+        slide_size.set("type", _slide_size_type(width_emu, height_emu))
 DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 P14_NS = "http://schemas.microsoft.com/office/powerpoint/2010/main"
@@ -2984,6 +3004,9 @@ def _unwrap_placeholder_carrier(
         state.shapes.pop(wrapper_id, None)
     if carrier_id:
         state.shapes[carrier_id] = carrier
+    if wrapper_id and carrier_id:
+        # An animation that names the slot group now targets its carrier.
+        _rewrite_roundtrip_timing_shape_ids(state.root, {wrapper_id: carrier_id})
     return carrier
 
 
@@ -3101,9 +3124,21 @@ def _remove_template_shape(
     sp_tree.remove(shape)
 
 
+def _template_reference_indices(
+    states: list[_TemplateRuntimeSlide],
+    public_slide_count: int | None,
+) -> list[int]:
+    """Use public pages as truth, or prototypes for an otherwise unused Master."""
+    return [
+        index for index, state in enumerate(states)
+        if public_slide_count is None or state.spec.slide_num <= public_slide_count
+    ] or list(range(len(states)))
+
+
 def _move_template_background(
     states: list[_TemplateRuntimeSlide],
     target_path: Path,
+    public_slide_count: int | None = None,
 ) -> str:
     backgrounds = [
         _extract_slide_background_xml(state.slide_path.read_text(encoding="utf-8"))
@@ -3114,8 +3149,10 @@ def _move_template_background(
             "Template background metadata must resolve to an explicit background "
             "on every affected slide"
         )
+    reference_indices = _template_reference_indices(states, public_slide_count)
     canonical_backgrounds = set()
-    for background in backgrounds:
+    for index in reference_indices:
+        background = backgrounds[index]
         if background is None:
             continue
         wrapper = ET.fromstring(
@@ -3125,11 +3162,11 @@ def _move_template_background(
             ET.tostring(list(wrapper)[0], encoding="utf-8")
         )
     if len(canonical_backgrounds) != 1:
-        slide_names = ", ".join(state.spec.svg_path.name for state in states)
+        slide_names = ", ".join(states[index].spec.svg_path.name for index in reference_indices)
         raise TemplateStructureError(
             f"Explicit template background differs across slides: {slide_names}"
         )
-    background_xml = backgrounds[0]
+    background_xml = backgrounds[reference_indices[0]]
     if background_xml is None:
         raise TemplateStructureError("Template background is unexpectedly empty")
     target_xml = target_path.read_text(encoding="utf-8")
@@ -3158,6 +3195,7 @@ def _move_template_solid_background_shapes(
     shapes: list[ET.Element],
     target_path: Path,
     slide_size_emu: tuple[int, int],
+    public_slide_count: int | None = None,
 ) -> str | None:
     """Move repeated full-slide solid rects into a master/layout p:bg."""
     backgrounds = [
@@ -3171,13 +3209,14 @@ def _move_template_solid_background_shapes(
             "A template background resolves to a full-slide solid rect on only "
             "some slides sharing the structure"
         )
-    canonical = {background for background in backgrounds if background is not None}
+    reference_indices = _template_reference_indices(states, public_slide_count)
+    canonical = {backgrounds[index] for index in reference_indices}
     if len(canonical) != 1:
-        slide_names = ", ".join(state.spec.svg_path.name for state in states)
+        slide_names = ", ".join(states[index].spec.svg_path.name for index in reference_indices)
         raise TemplateStructureError(
             f"Explicit template solid background differs across slides: {slide_names}"
         )
-    background_xml = backgrounds[0]
+    background_xml = backgrounds[reference_indices[0]]
     if background_xml is None:
         return None
     target_xml = target_path.read_text(encoding="utf-8")
@@ -3264,6 +3303,7 @@ def _move_template_static_shape(
     target_path: Path,
     target_rels_path: Path,
     slide_size_emu: tuple[int, int],
+    public_slide_count: int | None = None,
 ) -> str | None:
     shapes = [_template_shape_for_item(state, item) for state in states]
     if any(shape is None for shape in shapes):
@@ -3271,7 +3311,7 @@ def _move_template_static_shape(
             raise TemplateStructureError(
                 f"{item.element_id}: structure item is a background on only some slides"
             )
-        return _move_template_background(states, target_path)
+        return _move_template_background(states, target_path, public_slide_count)
 
     resolved_shapes = [shape for shape in shapes if shape is not None]
     if item.is_background:
@@ -3280,18 +3320,27 @@ def _move_template_static_shape(
             resolved_shapes,
             target_path,
             slide_size_emu,
+            public_slide_count,
         )
         if background_xml is None:
             raise TemplateStructureError(
                 f"{item.element_id!r} must compile to one exact p:bg payload"
             )
         return background_xml
+    # Internal Layout carriers compile unused prototypes as authored; their
+    # copy of a master atom leaves with the carrier slide, so the published
+    # pages alone decide the atom (a re-skinned rule must not be refused
+    # because an unused prototype still carries the original paint).
+    reference = [
+        (states[index], resolved_shapes[index])
+        for index in _template_reference_indices(states, public_slide_count)
+    ]
     canonical = {
         _canonical_shape_xml(shape, state.rels)
-        for state, shape in zip(states, resolved_shapes)
+        for state, shape in reference
     }
     if len(canonical) != 1:
-        slide_names = ", ".join(state.spec.svg_path.name for state in states)
+        slide_names = ", ".join(state.spec.svg_path.name for state, _shape in reference)
         raise TemplateStructureError(
             f"Explicit structure element {item.element_id!r} differs across slides: "
             f"{slide_names}"
@@ -3309,8 +3358,7 @@ def _move_template_static_shape(
                 "uses a relationship that cannot move to a template part"
             )
 
-    prototype_state = states[0]
-    prototype_shape = resolved_shapes[0]
+    prototype_state, prototype_shape = reference[0]
     target_shape = _copy_shape_relationships_to_part(
         prototype_shape,
         prototype_state.rels,
@@ -3681,13 +3729,15 @@ def _set_placeholder_theme_font_role(
     item: TemplateElementSpec,
     theme_font_spec: ThemeFontSpec | None,
 ) -> None:
-    """Force semantic text placeholders onto the correct theme font role."""
+    """Use the placeholder's theme role only when it preserves the actual face."""
     if theme_font_spec is None:
         return
     if item.placeholder == "title":
         prefix = "+mj"
+        target_face = theme_font_spec.major
     elif item.placeholder in TEMPLATE_PLACEHOLDER_TYPES:
         prefix = "+mn"
+        target_face = theme_font_spec.minor
     else:
         return
     for props_tag in ("rPr", "defRPr", "endParaRPr"):
@@ -3695,7 +3745,13 @@ def _set_placeholder_theme_font_role(
             for font_tag, suffix in (("latin", "lt"), ("ea", "ea"), ("cs", "cs")):
                 font = props.find(f"{{{DML_NS}}}{font_tag}")
                 if font is not None:
-                    font.set("typeface", f"{prefix}-{suffix}")
+                    face = font.get("typeface")
+                    if face == f"+mj-{suffix}":
+                        face = getattr(theme_font_spec.major, font_tag)
+                    elif face == f"+mn-{suffix}":
+                        face = getattr(theme_font_spec.minor, font_tag)
+                    if face and face == getattr(target_face, font_tag):
+                        font.set("typeface", f"{prefix}-{suffix}")
 
 
 def _layout_placeholder_shape(
@@ -3903,6 +3959,7 @@ def _apply_explicit_layout_structure(
     theme_font_spec: ThemeFontSpec | None,
     *,
     use_layout_placeholder_frames: bool = False,
+    public_slide_count: int | None = None,
     verbose: bool = False,
 ) -> tuple[
     dict[str, str | None],
@@ -3942,6 +3999,7 @@ def _apply_explicit_layout_structure(
                 master_path,
                 master_rels_path,
                 slide_size_emu,
+                public_slide_count=public_slide_count,
             )
             if background_xml is not None:
                 expected_backgrounds[master_part] = background_xml
@@ -4441,8 +4499,16 @@ def _replace_literal_run_with_slidenum_field(
     if tx_body is None:
         return False
     a_t = f"{{{DML_NS}}}t"
+
+    def _is_expected(text: str) -> bool:
+        # A zero-padded literal ("02") names the same slide as "2".
+        stripped = text.strip()
+        return stripped == expected_text or (
+            stripped.isdigit() and str(int(stripped)) == expected_text
+        )
+
     total_text = "".join(t.text or "" for t in tx_body.iter(a_t))
-    if total_text.strip() != expected_text:
+    if not _is_expected(total_text):
         return False
     text_runs = [
         (paragraph, run)
@@ -4453,7 +4519,7 @@ def _replace_literal_run_with_slidenum_field(
     if len(text_runs) != 1:
         return False
     paragraph, run = text_runs[0]
-    if (run.findtext(a_t) or "").strip() != expected_text:
+    if not _is_expected(run.findtext(a_t) or ""):
         return False
 
     fld = ET.Element(f"{{{DML_NS}}}fld", {"id": field_guid, "type": "slidenum"})
@@ -5120,14 +5186,19 @@ def _relax_output_permissions(output_path: Path) -> list[str]:
         result = subprocess.run(
             ['icacls', str(output_path), '/grant', '*S-1-5-32-545:R'],
             capture_output=True,
-            text=True,
             check=False,
         )
     except OSError as exc:
         warnings.append(f"icacls skipped for {output_path}: {exc}")
     else:
         if result.returncode != 0:
-            message = (result.stderr or result.stdout or '').strip()
+            # icacls writes in the console OEM code page, so decode lazily
+            # and leniently; text mode would decode under the interpreter's
+            # encoding (UTF-8 in UTF-8 mode) and raise inside the reader
+            # thread on non-ASCII bytes.
+            message = (result.stderr or result.stdout or b'').decode(
+                'oem', errors='replace',
+            ).strip()
             details = f": {message}" if message else ''
             warnings.append(f"icacls failed for {output_path}{details}")
 
@@ -5979,6 +6050,68 @@ def _prerender_legacy_pngs(
     return results
 
 
+def _rtl_text_levels(xml: str) -> str:
+    """Flip template text-level defaults (``rtl="0"``) to right-to-left."""
+    def flip(match: re.Match[str]) -> str:
+        tag = match.group(0).replace('rtl="0"', 'rtl="1"')
+        return tag.replace('algn="l"', 'algn="r"')
+
+    return re.sub(r'<a:(?:lvl\dpPr|pPr)\b[^>]*\brtl="0"[^>]*>', flip, xml)
+
+
+def _apply_template_text_language(extract_dir: Path, language: str) -> None:
+    """Tag template defaults with the deck language and authored runs by script.
+
+    Covers the presentation default text style (new text boxes) and master and
+    layout placeholders, so proofing follows the deck rather than en-US; a
+    right-to-left deck also gets right-to-left, right-aligned default levels.
+    """
+    rtl = language_uses_rtl(language)
+    ppt_dir = extract_dir / "ppt"
+    parts = [ppt_dir / "presentation.xml"]
+    parts += sorted((ppt_dir / "slideMasters").glob("slideMaster*.xml"))
+    parts += sorted((ppt_dir / "slideLayouts").glob("slideLayout*.xml"))
+    for part in parts:
+        if not part.is_file():
+            continue
+        xml = part.read_text(encoding="utf-8")
+        root = ET.fromstring(xml)
+        language_updates = {
+            props: language
+            for tag in ("defRPr", "endParaRPr")
+            for props in root.iter(f"{{{DML_NS}}}{tag}")
+        }
+        for tag in ("r", "fld"):
+            for run in root.iter(f"{{{DML_NS}}}{tag}"):
+                text = run.find(f"{{{DML_NS}}}t")
+                if text is None or not (text.text or "").strip():
+                    continue
+                props = run.find(f"{{{DML_NS}}}rPr")
+                if props is None:
+                    props = ET.Element(f"{{{DML_NS}}}rPr")
+                    run.insert(0, props)
+                language_updates[props] = detect_text_lang(text.text, language)
+        for shape in root.iter(f"{{{PML_NS}}}sp"):
+            placeholder = shape.find(
+                f"{{{PML_NS}}}nvSpPr/{{{PML_NS}}}nvPr/{{{PML_NS}}}ph"
+            )
+            if placeholder is not None and not any(
+                (text.text or "").strip() for text in shape.iter(f"{{{DML_NS}}}t")
+            ):
+                for props in shape.iter(f"{{{DML_NS}}}rPr"):
+                    language_updates[props] = language
+        changed = False
+        for props, text_language in language_updates.items():
+            if props.get("lang") != text_language:
+                props.set("lang", text_language)
+                changed = True
+        updated = serialize_source_xml(root, xml).decode("utf-8") if changed else xml
+        if rtl:
+            updated = _rtl_text_levels(updated)
+        if updated != xml:
+            part.write_text(updated, encoding="utf-8")
+
+
 def _presentation_format(width: float, height: float) -> str:
     """Map the slide aspect ratio to PowerPoint's PresentationFormat label.
     Non-standard ratios (square, portrait, banner crops) report 'Custom'.
@@ -6528,7 +6661,7 @@ def create_pptx_with_native_svg(
         )
     text_flow = resolve_text_flow(text_flow, merge_paragraphs)
     if primary_language is not None:
-        primary_language = normalize_language_tag(primary_language)
+        primary_language = office_language_tag(primary_language)
     public_svg_files = list(svg_files)
     passthrough_slides = set(roundtrip_passthrough_slides or set())
     slide_patches = dict(roundtrip_slide_patches or {})
@@ -6852,6 +6985,7 @@ def create_pptx_with_native_svg(
             prs = Presentation()
             prs.slide_width = width_emu
             prs.slide_height = height_emu
+            _set_slide_size_type(prs, width_emu, height_emu)
 
             blank_layout = prs.slide_layouts[6]
             for _ in svg_files:
@@ -7926,6 +8060,7 @@ def create_pptx_with_native_svg(
                 conversion_trace if conversion_trace is not None else structure_trace,
                 active_theme_font_spec,
                 use_layout_placeholder_frames=use_layout_placeholder_frames,
+                public_slide_count=public_slide_count,
                 verbose=verbose,
             )
             if source_theme_xml_by_master is not None:
@@ -8146,6 +8281,9 @@ def create_pptx_with_native_svg(
                 'PPTX package contains dangling internal relationship targets; '
                 'PowerPoint will report the file as corrupt:\n' + details
             )
+
+        if primary_language is not None and not roundtrip_export:
+            _apply_template_text_language(extract_dir, primary_language)
 
         # Replace the python-pptx base-template metadata (stale "Steve Canny"
         # author, 2013 dates, "generated using python-pptx", Slides=0) with
