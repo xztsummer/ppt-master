@@ -12,7 +12,7 @@
     data-pptx-layer="layout" data-pptx-editable="false"/>
 
   <g id="ending-title-slot" data-pptx-placeholder="title"
-    data-pptx-bounds="191 265 897 108">
+    data-pptx-bounds="191 265 897 135">
     <text id="ending-title-carrier" data-pptx-carrier="true"
       x="640" y="360" text-anchor="middle" fill="#FFFFFF"
       font-family="Arial, Microsoft YaHei, sans-serif"
