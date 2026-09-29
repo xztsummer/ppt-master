@@ -55,7 +55,7 @@
     "skills/ppt-master/references/artifact-ownership.md": 4500,
     "skills/ppt-master/workflows/governance/failure-recovery.md": 2750,
     "skills/ppt-master/workflows/stages/resume-execute.md": 1750,
-    "skills/ppt-master/workflows/stages/refine-spec.md": 1000,
+    "skills/ppt-master/workflows/stages/refine-spec.md": 1500,
     "skills/ppt-master/workflows/stages/verify-charts.md": 2500,
     "skills/ppt-master/workflows/stages/topic-research.md": 2000,
     "skills/ppt-master/workflows/stages/live-preview.md": 1000,
@@ -65,7 +65,7 @@
     "skills/ppt-master/workflows/stages/generate-audio.md": 4000,
     "skills/ppt-master/workflows/profiles/beautify-pptx.md": 5000,
     "skills/ppt-master/workflows/profiles/image-to-pptx.md": 3250,
-    "skills/ppt-master/workflows/edit-native-pptx.md": 4250,
+    "skills/ppt-master/workflows/edit-native-pptx.md": 4500,
     "skills/ppt-master/workflows/create-template.md": 10000,
     "skills/ppt-master/references/template-designer.md": 7000,
     "skills/ppt-master/workflows/create-template/create-brand.md": 1500,
@@ -2428,6 +2428,10 @@
       {
         "glob": "skills/ppt-master/scripts/docs/svg_editor.md",
         "reason": "Browser editor behavior and lifecycle reference; the live-preview stage carries the launch and annotation procedure."
+      },
+      {
+        "glob": "skills/ppt-master/scripts/docs/spec_review.md",
+        "reason": "Spec review tool reference for browser editing, annotation sidecars, HTTP APIs, and server lifecycle; not loaded as runtime prompt context."
       },
       {
         "glob": "skills/ppt-master/scripts/docs/narration.md",
