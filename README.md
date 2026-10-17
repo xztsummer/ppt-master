@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Skill Version](https://img.shields.io/badge/skill%20version-6.7.0-green.svg)](./SKILL.md)
+[![Skill Version](https://img.shields.io/badge/skill%20version-6.7.1-green.svg)](./SKILL.md)
 
 > **English TL;DR** — PPT Master is an agentic-skill workflow that turns source material into
 > **natively editable** PowerPoint files (real DrawingML shapes, charts, tables, formulas and
@@ -96,7 +96,7 @@ AI 全程处理：内容分析、视觉设计、SVG 生成、质量检查、PPTX
 
 ## 与上游仓库的关系
 
-本仓库是从 [hugohe3/ppt-master](https://github.com/hugohe3/ppt-master) **v6.7.0（MIT License）** 提取的纯 skill 技能包，并在本地定制基础上再发布（含新增的 `中国电子云` deck 模板等）。
+本仓库是从 [hugohe3/ppt-master](https://github.com/hugohe3/ppt-master) **v6.7.1（MIT License）** 提取的纯 skill 技能包，并在本地定制基础上再发布（含新增的 `中国电子云` deck 模板等）。
 
 感谢原作者 [Hugo He](https://github.com/hugohe3) 的开源贡献。上游完整仓库还包含用户文档（快速入门 / FAQ / Windows 安装指南 / 技术设计）、示例工程与持续更新，推荐访问：
 
